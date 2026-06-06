@@ -415,23 +415,24 @@ class UniversalSpectrumEncoder:
         pad_mask = (tokens.sum(axis=-1) == 0)   # (B, K)
         return tokens, pad_mask
 
-    @torch.no_grad()
     def encode(self, spectra: List[Spectrum], logger: logging.Logger) -> np.ndarray:
         N = len(spectra)
         out = np.zeros((N, self.cfg.embed_dim), dtype=np.float32)
         bs = self.cfg.batch_size
         n_batches = math.ceil(N / bs)
-        for b in tqdm(range(n_batches), desc="Stage1 encoding", unit="batch"):
-            sl = slice(b * bs, (b + 1) * bs)
-            batch = spectra[sl]
+
+        def _run_batch(batch):
             if self._torch:
                 tokens, pad_mask = self._make_peak_token_batch(batch)
                 t_tok = torch.from_numpy(tokens).to(self.device)
                 t_pad = torch.from_numpy(pad_mask).to(self.device)
-                emb = self.model(t_tok, t_pad).cpu().numpy()
-            else:
-                emb = self.model.encode_batch(batch)
-            out[sl] = emb
+                with torch.no_grad():
+                    return self.model(t_tok, t_pad).cpu().numpy()
+            return self.model.encode_batch(batch)
+
+        for b in tqdm(range(n_batches), desc="Stage1 encoding", unit="batch"):
+            sl = slice(b * bs, (b + 1) * bs)
+            out[sl] = _run_batch(spectra[sl])
         logger.info(f"Stage 1 complete: {N} embeddings, dim={self.cfg.embed_dim}")
         return out
 

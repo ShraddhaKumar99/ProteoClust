@@ -557,8 +557,12 @@ def compute_spectral_embedding(W: csr_matrix, k: int,
 
 
 def _dbscan_on_spectral(Z: np.ndarray, cfg: Config) -> np.ndarray:
+    # Z is low-dimensional (≈30 cols), so a ball_tree radius search is both
+    # far more memory-efficient than brute-force pairwise-distance chunks
+    # (which allocate large (chunk, N) blocks and fragment on Windows) and
+    # asymptotically faster — O(N log N) vs O(N²).
     db = DBSCAN(eps=cfg.dbscan_eps, min_samples=cfg.dbscan_min_samples,
-                metric="euclidean", n_jobs=cfg.n_jobs)
+                metric="euclidean", algorithm="ball_tree", n_jobs=cfg.n_jobs)
     return db.fit_predict(Z)
 
 
@@ -1007,7 +1011,7 @@ if __name__ == "__main__":
     else:
         # ── Spyder / direct execution — edit these paths ───────────────────
         cfg = Config(
-            mgf_path="data/ups_dataset.mgf",      # ← change to your MGF path
+            mgf_path="D:\\Shraddha\\Original MGFs\\COREAD\\20201022_FS_Choudhary_LMS2_FS03_MS2_16plex.mgf",      # ← change to your MGF path
             output_dir="proteoclust_out",
             # Adjust for your dataset size:
             # For COREAD (2.7 GB) use batch_size=1024, ann_n_neighbours=50

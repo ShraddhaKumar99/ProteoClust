@@ -71,6 +71,7 @@ class Config:
     # ── I/O ──────────────────────────────────────────────────────────────────
     mgf_path: str = ""
     output_dir: str = "proteoclust_out"
+    resume: bool = False  # cache/reuse Stage 1 & 2 results across interrupted runs
 
     # ── Stage 1 — Encoder ────────────────────────────────────────────────────
     mz_min: float = 50.0          # m/z range start
@@ -93,6 +94,7 @@ class Config:
     merge_dist_threshold: float = 0.05  # dynamic merge threshold
     max_edges_per_node: int = 50  # cap edges to keep graph sparse
     ann_n_neighbours: int = 100   # approximate NN search width
+    ann_query_chunk_size: int = 2000  # rows per kneighbors() call (memory cap)
 
     # ── Stage 3 — Reranker ───────────────────────────────────────────────────
     sigma_q: float = 0.10         # quality score temperature
@@ -420,19 +422,18 @@ class UniversalSpectrumEncoder:
         out = np.zeros((N, self.cfg.embed_dim), dtype=np.float32)
         bs = self.cfg.batch_size
         n_batches = math.ceil(N / bs)
-
-        def _run_batch(batch):
+        for b in tqdm(range(n_batches), desc="Stage1 encoding", unit="batch"):
+            sl = slice(b * bs, (b + 1) * bs)
+            batch = spectra[sl]
             if self._torch:
                 tokens, pad_mask = self._make_peak_token_batch(batch)
                 t_tok = torch.from_numpy(tokens).to(self.device)
                 t_pad = torch.from_numpy(pad_mask).to(self.device)
                 with torch.no_grad():
-                    return self.model(t_tok, t_pad).cpu().numpy()
-            return self.model.encode_batch(batch)
-
-        for b in tqdm(range(n_batches), desc="Stage1 encoding", unit="batch"):
-            sl = slice(b * bs, (b + 1) * bs)
-            out[sl] = _run_batch(spectra[sl])
+                    emb = self.model(t_tok, t_pad).cpu().numpy()
+            else:
+                emb = self.model.encode_batch(batch)
+            out[sl] = emb
         logger.info(f"Stage 1 complete: {N} embeddings, dim={self.cfg.embed_dim}")
         return out
 
@@ -473,31 +474,41 @@ def build_sparse_similarity_graph(
     nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine",
                           algorithm="brute", n_jobs=cfg.n_jobs)
     nn.fit(embeddings)
-    dists, indices = nn.kneighbors(embeddings)   # (N, k+1)
 
     # Build COO lists
     rows, cols, data = [], [], []
 
-    for i in tqdm(range(N), desc="Stage2 graph build", unit=" node"):
-        for rank in range(1, k + 1):           # skip self (rank=0)
-            j = int(indices[i, rank])
-            cos_dist = float(dists[i, rank])
-            cos_sim = max(0.0, 1.0 - cos_dist)
+    # Query neighbours in row-chunks to bound peak memory usage — a single
+    # call to kneighbors(embeddings) materialises an (N, N) pairwise-distance
+    # block internally for brute-force cosine search, which can blow up to
+    # many GB for large N. Chunking keeps each block at (chunk, N).
+    chunk_size = max(1, min(N, cfg.ann_query_chunk_size))
 
-            # Hard precursor mass filter
-            if abs(pmz[i] - pmz[j]) > cfg.precursor_tol_da:
-                continue
+    for start in tqdm(range(0, N, chunk_size), desc="Stage2 ANN query", unit=" chunk"):
+        end = min(start + chunk_size, N)
+        dists, indices = nn.kneighbors(embeddings[start:end])   # (chunk, k+1)
 
-            p_score = _precursor_score(pmz[i], pmz[j], pcharge[i], pcharge[j],
-                                       cfg.precursor_tol_da)
-            w = cos_sim * p_score
+        for offset in range(end - start):
+            i = start + offset
+            for rank in range(1, k + 1):           # skip self (rank=0)
+                j = int(indices[offset, rank])
+                cos_dist = float(dists[offset, rank])
+                cos_sim = max(0.0, 1.0 - cos_dist)
 
-            if w < cfg.edge_threshold:
-                continue
+                # Hard precursor mass filter
+                if abs(pmz[i] - pmz[j]) > cfg.precursor_tol_da:
+                    continue
 
-            rows.append(i)
-            cols.append(j)
-            data.append(w)
+                p_score = _precursor_score(pmz[i], pmz[j], pcharge[i], pcharge[j],
+                                           cfg.precursor_tol_da)
+                w = cos_sim * p_score
+
+                if w < cfg.edge_threshold:
+                    continue
+
+                rows.append(i)
+                cols.append(j)
+                data.append(w)
 
     if not data:
         logger.warning("No edges above threshold — lowering edge_threshold may help.")
@@ -861,19 +872,41 @@ def run_pipeline(cfg: Config) -> List[Cluster]:
         return []
     logger.info(f"Loaded {len(spectra):,} spectra")
 
+    # ── Checkpointing ─────────────────────────────────────────────────────────
+    # Resuming a long run after a sleep/crash skips already-completed stages by
+    # loading cached intermediate arrays from <output_dir>/checkpoints/.
+    ckpt_dir = os.path.join(cfg.output_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    emb_ckpt = os.path.join(ckpt_dir, f"embeddings_n{len(spectra)}.npy")
+    lbl_ckpt = os.path.join(ckpt_dir, f"labels_n{len(spectra)}.npy")
+
     # ── Stage 1 ───────────────────────────────────────────────────────────────
     logger.info("=" * 50)
     logger.info("STAGE 1 — Universal Spectrum Encoder")
-    encoder = UniversalSpectrumEncoder(cfg)
-    embeddings = encoder.encode(spectra, logger)
-    del encoder
-    gc.collect()
+    if cfg.resume and os.path.exists(emb_ckpt):
+        logger.info(f"Resuming: loading cached embeddings from {emb_ckpt}")
+        embeddings = np.load(emb_ckpt)
+    else:
+        encoder = UniversalSpectrumEncoder(cfg)
+        embeddings = encoder.encode(spectra, logger)
+        del encoder
+        gc.collect()
+        if cfg.resume:
+            np.save(emb_ckpt, embeddings)
+            logger.info(f"Checkpoint saved: {emb_ckpt}")
 
     # ── Stage 2 ───────────────────────────────────────────────────────────────
     logger.info("=" * 50)
     logger.info("STAGE 2 — Hierarchical Graph Clustering Engine")
-    labels = run_hgce(embeddings, spectra, cfg, logger)
-    gc.collect()
+    if cfg.resume and os.path.exists(lbl_ckpt):
+        logger.info(f"Resuming: loading cached cluster labels from {lbl_ckpt}")
+        labels = np.load(lbl_ckpt)
+    else:
+        labels = run_hgce(embeddings, spectra, cfg, logger)
+        gc.collect()
+        if cfg.resume:
+            np.save(lbl_ckpt, labels)
+            logger.info(f"Checkpoint saved: {lbl_ckpt}")
 
     # ── Stage 3 ───────────────────────────────────────────────────────────────
     logger.info("=" * 50)
@@ -926,6 +959,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-spectra", type=int, default=None,
                    help="Truncate input for quick testing")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="Cache Stage 1/2 results in <out>/checkpoints and "
+                        "reuse them on a subsequent run (e.g. after sleep/crash)")
     return p
 
 
@@ -952,6 +988,7 @@ def main() -> None:
         device=args.device,
         max_spectra=args.max_spectra,
         verbose=not args.quiet,
+        resume=args.resume,
     )
     run_pipeline(cfg)
 

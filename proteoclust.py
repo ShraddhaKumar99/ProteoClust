@@ -561,8 +561,15 @@ def _dbscan_on_spectral(Z: np.ndarray, cfg: Config) -> np.ndarray:
     # far more memory-efficient than brute-force pairwise-distance chunks
     # (which allocate large (chunk, N) blocks and fragment on Windows) and
     # asymptotically faster — O(N log N) vs O(N²).
+    #
+    # n_jobs is forced to 1: DBSCAN's radius_neighbors parallelises over a
+    # multiprocessing/loky pool, which pickles and duplicates the ball_tree
+    # (and its query buffers) into every worker process — for N≈500K this
+    # multiplies peak memory by the worker count and triggers MemoryError
+    # well before a single-threaded query would. A single-threaded ball_tree
+    # query is already near-linear and fast enough for this workload.
     db = DBSCAN(eps=cfg.dbscan_eps, min_samples=cfg.dbscan_min_samples,
-                metric="euclidean", algorithm="ball_tree", n_jobs=cfg.n_jobs)
+                metric="euclidean", algorithm="ball_tree", n_jobs=1)
     return db.fit_predict(Z)
 
 

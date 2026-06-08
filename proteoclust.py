@@ -41,8 +41,7 @@ from scipy.sparse.linalg import eigsh
 from scipy.spatial.distance import cdist
 from scipy.stats import kurtosis, skew
 from sklearn.preprocessing import normalize
-from sklearn.cluster import DBSCAN
-from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import NearestNeighbors, BallTree
 from tqdm import tqdm
 
 # Torch is used for the lightweight transformer encoder only; it gracefully
@@ -557,20 +556,81 @@ def compute_spectral_embedding(W: csr_matrix, k: int,
 
 
 def _dbscan_on_spectral(Z: np.ndarray, cfg: Config) -> np.ndarray:
-    # Z is low-dimensional (≈30 cols), so a ball_tree radius search is both
-    # far more memory-efficient than brute-force pairwise-distance chunks
-    # (which allocate large (chunk, N) blocks and fragment on Windows) and
-    # asymptotically faster — O(N log N) vs O(N²).
-    #
-    # n_jobs is forced to 1: DBSCAN's radius_neighbors parallelises over a
-    # multiprocessing/loky pool, which pickles and duplicates the ball_tree
-    # (and its query buffers) into every worker process — for N≈500K this
-    # multiplies peak memory by the worker count and triggers MemoryError
-    # well before a single-threaded query would. A single-threaded ball_tree
-    # query is already near-linear and fast enough for this workload.
-    db = DBSCAN(eps=cfg.dbscan_eps, min_samples=cfg.dbscan_min_samples,
-                metric="euclidean", algorithm="ball_tree", n_jobs=1)
-    return db.fit_predict(Z)
+    """Exact DBSCAN via a chunked BallTree radius search + union-find.
+
+    sklearn's DBSCAN materialises *all* point neighbourhoods from a single
+    `radius_neighbors` call before clustering. For N≈500K, if even a modest
+    fraction of points sit in dense regions, the combined neighbour-index
+    arrays can run into the GB range and trigger MemoryError (independent of
+    n_jobs — the allocation happens inside `query_radius` itself). Querying
+    the tree in row-chunks keeps at most `chunk` neighbourhoods resident at
+    once, and a union-find over (core-point, neighbour) pairs reproduces
+    sklearn's exact DBSCAN semantics — same labels, bounded memory.
+    """
+    N = Z.shape[0]
+    eps = cfg.dbscan_eps
+    min_samples = cfg.dbscan_min_samples
+
+    tree = BallTree(Z, metric="euclidean")
+
+    chunk = max(1, min(N, cfg.ann_query_chunk_size))
+    n_neighbors = np.empty(N, dtype=np.int64)
+    parent = np.arange(N, dtype=np.int64)
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    is_core = np.zeros(N, dtype=bool)
+
+    for start in tqdm(range(0, N, chunk), desc="Stage2 DBSCAN radius query", unit=" chunk"):
+        end = min(start + chunk, N)
+        neigh = tree.query_radius(Z[start:end], r=eps, return_distance=False)
+        for offset, idxs in enumerate(neigh):
+            i = start + offset
+            n_neighbors[i] = len(idxs)
+            if len(idxs) >= min_samples:
+                is_core[i] = True
+                for j in idxs:
+                    j = int(j)
+                    if j != i:
+                        union(i, j)
+
+    labels = np.full(N, -1, dtype=np.int64)
+    root_to_label: Dict[int, int] = {}
+    next_label = 0
+    for i in range(N):
+        if not is_core[i]:
+            continue
+        root = find(i)
+        if root not in root_to_label:
+            root_to_label[root] = next_label
+            next_label += 1
+        labels[i] = root_to_label[root]
+
+    # Border points: assign to the cluster of any core neighbour (sklearn
+    # behaviour — first-found cluster wins, ties broken by scan order).
+    for start in tqdm(range(0, N, chunk), desc="Stage2 DBSCAN border assign", unit=" chunk"):
+        end = min(start + chunk, N)
+        neigh = tree.query_radius(Z[start:end], r=eps, return_distance=False)
+        for offset, idxs in enumerate(neigh):
+            i = start + offset
+            if is_core[i] or labels[i] != -1:
+                continue
+            for j in idxs:
+                j = int(j)
+                if is_core[j]:
+                    labels[i] = labels[j]
+                    break
+
+    return labels
 
 
 def _within_cluster_variance(member_embs: np.ndarray) -> float:

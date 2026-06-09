@@ -676,7 +676,7 @@ def dynamic_split(labels: np.ndarray, embeddings: np.ndarray,
 
 def dynamic_merge(labels: np.ndarray, embeddings: np.ndarray,
                   cfg: Config, logger: logging.Logger) -> np.ndarray:
-    """Merge clusters whose centroids are closer than threshold."""
+    """Merge clusters whose centroids are closer than merge_dist_threshold."""
     unique = sorted([c for c in np.unique(labels) if c >= 0])
     if len(unique) < 2:
         return labels
@@ -686,28 +686,39 @@ def dynamic_merge(labels: np.ndarray, embeddings: np.ndarray,
         for c in unique
     ])
 
-    new_labels = labels.copy()
-    label_map = {c: c for c in unique}
+    # Vectorised pairwise cosine distances — O(k²) in numpy rather than a
+    # Python nested loop (which would be ~47M iterations for k≈10K clusters).
+    # cosine_dist = 1 - (C @ C.T)  for unit-norm rows.
+    sim_matrix = centroids @ centroids.T          # (k, k) cosine similarities
+    np.fill_diagonal(sim_matrix, 0.0)             # ignore self-similarity
+    close_i, close_j = np.where(
+        (1.0 - sim_matrix) < cfg.merge_dist_threshold
+    )
+    # Keep only upper triangle to avoid double-counting
+    mask = close_i < close_j
+    close_i, close_j = close_i[mask], close_j[mask]
+
+    # Union-find over cluster indices (positions in `unique`)
+    parent = list(range(len(unique)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
     merges = 0
+    for pi, pj in zip(close_i.tolist(), close_j.tolist()):
+        ri, rj = find(pi), find(pj)
+        if ri != rj:
+            parent[rj] = ri
+            merges += 1
 
-    for i, ci in enumerate(unique):
-        for j in range(i + 1, len(unique)):
-            cj = unique[j]
-            dist = float(cdist(centroids[i:i+1], centroids[j:j+1],
-                               metric="cosine")[0, 0])
-            if dist < cfg.merge_dist_threshold:
-                root_i = label_map[ci]
-                root_j = label_map[cj]
-                if root_i != root_j:
-                    target = min(root_i, root_j)
-                    source = max(root_i, root_j)
-                    for k in label_map:
-                        if label_map[k] == source:
-                            label_map[k] = target
-                    merges += 1
-
-    for c in unique:
-        new_labels[labels == c] = label_map[c]
+    # Build label remapping
+    new_labels = labels.copy()
+    root_label = {i: unique[find(i)] for i in range(len(unique))}
+    for pos, cid in enumerate(unique):
+        new_labels[labels == cid] = root_label[pos]
 
     logger.info(f"Dynamic merge: {merges} cluster pairs merged")
     return new_labels
@@ -1110,7 +1121,7 @@ if __name__ == "__main__":
         # ── Spyder / direct execution — edit these paths ───────────────────
         cfg = Config(
             mgf_path="D:\\Shraddha\\Original MGFs\\COREAD\\20201022_FS_Choudhary_LMS2_FS03_MS2_16plex.mgf",      # ← change to your MGF path
-            output_dir="D:\\Shraddha\\ProteoClust\\proteoclust_out",
+            output_dir="proteoclust_out",
 			resume=True,
             # Adjust for your dataset size:
             # For COREAD (2.7 GB) use batch_size=1024, ann_n_neighbours=50

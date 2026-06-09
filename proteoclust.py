@@ -1079,7 +1079,8 @@ if __name__ == "__main__":
         # ── Spyder / direct execution — edit these paths ───────────────────
         cfg = Config(
             mgf_path="D:\\Shraddha\\Original MGFs\\COREAD\\20201022_FS_Choudhary_LMS2_FS03_MS2_16plex.mgf",      # ← change to your MGF path
-            output_dir="proteoclust_out",
+	       output_dir="proteoclust_out",
+	       resume=True,
             # Adjust for your dataset size:
             # For COREAD (2.7 GB) use batch_size=1024, ann_n_neighbours=50
             # For UPS (128 MB)    use batch_size=2048, ann_n_neighbours=100

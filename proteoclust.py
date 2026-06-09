@@ -94,6 +94,7 @@ class Config:
     max_edges_per_node: int = 50  # cap edges to keep graph sparse
     ann_n_neighbours: int = 100   # approximate NN search width
     ann_query_chunk_size: int = 2000  # rows per kneighbors() call (memory cap)
+    large_n_threshold: int = 100_000  # above this use graph connected-components instead of spectral DBSCAN
 
     # ── Stage 3 — Reranker ───────────────────────────────────────────────────
     sigma_q: float = 0.10         # quality score temperature
@@ -722,17 +723,47 @@ def run_hgce(embeddings: np.ndarray, spectra: List[Spectrum],
         logger.warning("Empty graph — assigning all spectra to noise.")
         return np.full(len(spectra), -1, dtype=np.int32)
 
-    k = min(cfg.n_eigenvectors, len(spectra) - 2)
-    Z = compute_spectral_embedding(W, k, logger)
+    N = len(spectra)
 
-    logger.info("Running adaptive DBSCAN on spectral embedding …")
-    labels = _dbscan_on_spectral(Z, cfg)
+    # For large datasets the spectral-embedding+DBSCAN path is impractical
+    # (BallTree radius search degenerates at 30D for N>100K). Instead derive
+    # initial labels directly from connected components of the already-filtered
+    # similarity graph — O(N+E), memory-bounded, and exact given the graph's
+    # strict cosine×precursor threshold.  For small datasets (<= large_n_thresh)
+    # the traditional spectral path is retained for finer granularity.
+    large_n_thresh = cfg.large_n_threshold
+    if N <= large_n_thresh:
+        k = min(cfg.n_eigenvectors, N - 2)
+        Z = compute_spectral_embedding(W, k, logger)
+        logger.info("Running adaptive DBSCAN on spectral embedding …")
+        labels = _dbscan_on_spectral(Z, cfg)
+        work_embs = Z
+    else:
+        logger.info(f"N={N:,} > {large_n_thresh:,}: using graph connected-components "
+                    "as initial clusters (skips memory-intensive spectral DBSCAN) …")
+        from scipy.sparse.csgraph import connected_components
+        n_comp, comp_labels = connected_components(W, directed=False,
+                                                   connection="weak")
+        # Treat singleton components (no edges) as noise
+        comp_sizes = np.bincount(comp_labels, minlength=n_comp)
+        noise_comps = set(np.where(comp_sizes < cfg.dbscan_min_samples)[0])
+        labels = np.where(
+            np.isin(comp_labels, list(noise_comps)), -1, comp_labels.astype(np.int64)
+        )
+        # Re-number cluster ids to be contiguous starting from 0
+        unique_ids = np.unique(labels[labels >= 0])
+        remap = {old: new for new, old in enumerate(unique_ids)}
+        labels = np.array(
+            [remap[v] if v >= 0 else -1 for v in labels], dtype=np.int64
+        )
+        work_embs = embeddings
+
     n_clusters = len(set(labels) - {-1})
     n_noise = int((labels == -1).sum())
-    logger.info(f"Initial DBSCAN: {n_clusters} clusters, {n_noise} noise points")
+    logger.info(f"Initial clustering: {n_clusters} clusters, {n_noise} noise points")
 
-    labels = dynamic_split(labels, Z, cfg, logger)
-    labels = dynamic_merge(labels, Z, cfg, logger)
+    labels = dynamic_split(labels, work_embs, cfg, logger)
+    labels = dynamic_merge(labels, work_embs, cfg, logger)
 
     n_final = len(set(labels) - {-1})
     n_noise_final = int((labels == -1).sum())
@@ -1079,8 +1110,8 @@ if __name__ == "__main__":
         # ── Spyder / direct execution — edit these paths ───────────────────
         cfg = Config(
             mgf_path="D:\\Shraddha\\Original MGFs\\COREAD\\20201022_FS_Choudhary_LMS2_FS03_MS2_16plex.mgf",      # ← change to your MGF path
-	       output_dir="proteoclust_out",
-	       resume=True,
+            output_dir="D:\\Shraddha\\ProteoClust\\proteoclust_out",
+			resume=True,
             # Adjust for your dataset size:
             # For COREAD (2.7 GB) use batch_size=1024, ann_n_neighbours=50
             # For UPS (128 MB)    use batch_size=2048, ann_n_neighbours=100
